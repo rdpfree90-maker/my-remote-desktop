@@ -159,6 +159,15 @@ jobs:
 
           Write-Host "Complete RDP details sent to Telegram."
 
+      - name: Start Telegram File Receiver
+        shell: pwsh
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          ADMIN_ID: ${{ secrets.ADMIN_ID }}
+        run: |
+          python -m pip install pyTelegramBotAPI
+          Start-Process python -ArgumentList "telegram_receiver.py" -WindowStyle Hidden
+
       - name: Keep Windows RDP alive
         shell: pwsh
         run: |
