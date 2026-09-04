@@ -1,0 +1,322 @@
+name: Windows RDP via Tailscale
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 330
+
+    steps:
+      - name: Connect Windows runner to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+
+      - name: Optimize Windows desktop for portrait RDP
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+
+          # Do NOT force landscape or change the RDP session resolution.
+          # The mobile RDP client can keep the portrait resolution requested by the user.
+
+          # Make desktop icons and spacing a little smaller/cleaner.
+          $desktop = "HKCU:\Software\Microsoft\Windows\Shell\Bags\1\Desktop"
+          New-Item -Path $desktop -Force | Out-Null
+          Set-ItemProperty -Path $desktop -Name "IconSize" -Type DWord -Value 32 -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path $desktop -Name "Mode" -Type DWord -Value 4 -ErrorAction SilentlyContinue
+
+          # Keep Windows UI scaling at the normal 100% level.
+          Set-ItemProperty -Path "HKCU:\Control Panel\Desktop" -Name "LogPixels" -Type DWord -Value 96 -ErrorAction SilentlyContinue
+
+          # Slightly tighter icon spacing.
+          Set-ItemProperty -Path "HKCU:\Control Panel\Desktop\WindowMetrics" -Name "IconSpacing" -Type String -Value "-1050" -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path "HKCU:\Control Panel\Desktop\WindowMetrics" -Name "IconVerticalSpacing" -Type String -Value "-1050" -ErrorAction SilentlyContinue
+
+          Write-Host "Portrait RDP layout kept; desktop icons reduced and spacing tightened."
+
+          # Refresh Explorer so the desktop changes are picked up.
+          Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 2
+          Start-Process explorer.exe
+          Start-Sleep -Seconds 3
+
+      - name: Install Android Studio
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+
+          Write-Host "Installing Android Studio..."
+          $installed = $false
+
+          # Prefer WinGet on the current Windows runner.
+          $winget = Get-Command winget -ErrorAction SilentlyContinue
+          if ($winget) {
+            winget install --id Google.AndroidStudio --exact --silent --accept-source-agreements --accept-package-agreements
+            if ($LASTEXITCODE -eq 0) { $installed = $true }
+          }
+
+          # Fallback if WinGet is unavailable or the package install fails.
+          if (-not $installed) {
+            $choco = Get-Command choco -ErrorAction SilentlyContinue
+            if ($choco) {
+              choco install androidstudio -y --no-progress
+              if ($LASTEXITCODE -eq 0) { $installed = $true }
+            }
+          }
+
+          if (-not $installed) {
+            throw "Android Studio installation failed."
+          }
+
+          Start-Sleep -Seconds 5
+
+          $candidates = @(
+            "$env:ProgramFiles\Android\Android Studio\bin\studio64.exe",
+            "$env:LOCALAPPDATA\Programs\Android Studio\bin\studio64.exe",
+            "$env:ProgramFiles\Android Studio\bin\studio64.exe"
+          )
+          $studio = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+          if (-not $studio) {
+            $studio = Get-ChildItem -Path "$env:ProgramFiles", "$env:LOCALAPPDATA" -Filter studio64.exe -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
+          }
+
+          if ($studio) {
+            "ANDROID_STUDIO_EXE=$studio" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            Write-Host "Android Studio found: $studio"
+
+            $desktop = [Environment]::GetFolderPath("CommonDesktopDirectory")
+            $shell = New-Object -ComObject WScript.Shell
+            $shortcut = $shell.CreateShortcut((Join-Path $desktop "Android Studio.lnk"))
+            $shortcut.TargetPath = $studio
+            $shortcut.WorkingDirectory = Split-Path $studio
+            $shortcut.Save()
+          }
+          else {
+            Write-Warning "Android Studio installed but studio64.exe was not located yet. It can be located from the Start menu."
+          }
+
+      - name: Prepare Android Studio project folders
+        shell: pwsh
+        env:
+          RDP_USERNAME: ${{ secrets.user_name }}
+        run: |
+          $desktop = Join-Path $env:SystemDrive ("Users\" + $env:RDP_USERNAME + "\Desktop")
+          New-Item -ItemType Directory -Force -Path `
+            (Join-Path $desktop "AndroidStudio\Projects"), `
+            (Join-Path $desktop "AndroidStudio\Incoming"), `
+            (Join-Path $desktop "AndroidStudio\APKs"), `
+            (Join-Path $desktop "Telegram") | Out-Null
+
+          # Public shortcut is visible to the RDP user even though the workflow
+          # itself runs under the GitHub runner account.
+          $studio = @(`
+            "$env:ProgramFiles\Android\Android Studio\bin\studio64.exe", `
+            "$env:LOCALAPPDATA\Programs\Android Studio\bin\studio64.exe", `
+            "$env:ProgramFiles\Android Studio\bin\studio64.exe"
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+          if ($studio) {
+            $publicDesktop = [Environment]::GetFolderPath("CommonDesktopDirectory")
+            $shell = New-Object -ComObject WScript.Shell
+            $shortcut = $shell.CreateShortcut((Join-Path $publicDesktop "Android Studio.lnk"))
+            $shortcut.TargetPath = $studio
+            $shortcut.WorkingDirectory = Split-Path $studio
+            $shortcut.Save()
+          }
+
+          Write-Host "RDP user Desktop prepared: $desktop"
+
+      - name: Configure Windows RDP
+        shell: pwsh
+        env:
+          RDP_USERNAME: ${{ secrets.user_name }}
+          RDP_PASSWORD: ${{ secrets.PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if ([string]::IsNullOrWhiteSpace($env:RDP_USERNAME)) {
+            throw "GitHub Secret user_name is missing."
+          }
+
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+            throw "GitHub Secret PASSWORD is missing."
+          }
+
+          # Enable Remote Desktop
+          Set-ItemProperty `
+            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" `
+            -Name "fDenyTSConnections" `
+            -Value 0
+
+          Set-ItemProperty `
+            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
+            -Name "UserAuthentication" `
+            -Value 1
+
+          # Allow RDP through Windows Firewall
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
+          # Create/reset the requested local Windows user
+          $securePassword = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          $user = Get-LocalUser -Name $env:RDP_USERNAME -ErrorAction SilentlyContinue
+
+          if ($null -eq $user) {
+            New-LocalUser `
+              -Name $env:RDP_USERNAME `
+              -Password $securePassword `
+              -Description "Temporary GitHub Actions RDP user" `
+              -PasswordNeverExpires `
+              -AccountNeverExpires `
+              -UserMayNotChangePassword
+          }
+          else {
+            Set-LocalUser -Name $env:RDP_USERNAME -Password $securePassword
+            Enable-LocalUser -Name $env:RDP_USERNAME
+          }
+
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" `
+            -Member $env:RDP_USERNAME `
+            -ErrorAction SilentlyContinue
+
+          Restart-Service TermService -Force
+
+          Start-Sleep -Seconds 3
+
+          $listener = Get-NetTCPConnection `
+            -LocalPort 3389 `
+            -State Listen `
+            -ErrorAction SilentlyContinue
+
+          if ($null -eq $listener) {
+            throw "RDP is not listening on TCP 3389."
+          }
+
+          Write-Host "RDP listener is ready."
+
+      - name: Get Tailscale IP
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $ip = (tailscale ip -4).Trim()
+
+          if ([string]::IsNullOrWhiteSpace($ip)) {
+            throw "Could not get the Tailscale IPv4 address."
+          }
+
+          "TAILSCALE_IP=$ip" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          Write-Host "Tailscale IPv4: $ip"
+
+      - name: Send RDP details to Telegram
+        shell: pwsh
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          ADMIN_ID: ${{ secrets.ADMIN_ID }}
+          RDP_USERNAME: ${{ secrets.user_name }}
+          RDP_PASSWORD: ${{ secrets.PASSWORD }}
+          TAILSCALE_IP: ${{ env.TAILSCALE_IP }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if ([string]::IsNullOrWhiteSpace($env:BOT_TOKEN)) {
+            throw "GitHub Secret BOT_TOKEN is missing."
+          }
+
+          if ([string]::IsNullOrWhiteSpace($env:ADMIN_ID)) {
+            throw "GitHub Secret ADMIN_ID is missing."
+          }
+
+          # Escape values for Telegram HTML formatting.
+          function Escape-Html([string]$value) {
+            return $value.Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;")
+          }
+
+          $ip = Escape-Html $env:TAILSCALE_IP
+          $username = Escape-Html $env:RDP_USERNAME
+          $password = Escape-Html $env:RDP_PASSWORD
+
+          $message = @"
+          🟢 <b>Windows RDP Ready</b>
+
+          🌐 IP: <code>$ip</code>
+          🔌 Port: <code>3389</code>
+          👤 User: <code>$username</code>
+          🔑 Pass: <code>$password</code>
+
+          🛡️ Tailscale only
+          ⏳ Keep the Workflow running.
+          "@
+
+
+          $body = @{
+            chat_id    = $env:ADMIN_ID
+            text       = $message
+            parse_mode = "HTML"
+          }
+
+          $response = Invoke-RestMethod `
+            -Uri "https://api.telegram.org/bot$($env:BOT_TOKEN)/sendMessage" `
+            -Method Post `
+            -ContentType "application/x-www-form-urlencoded" `
+            -Body $body
+
+          if (-not $response.ok) {
+            throw "Telegram API returned an unsuccessful response."
+          }
+
+          Write-Host "Complete RDP details sent to Telegram."
+
+      - name: Start Telegram File Receiver
+        shell: pwsh
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          ADMIN_ID: ${{ secrets.ADMIN_ID }}
+          RDP_USERNAME: ${{ secrets.user_name }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          python -m pip install --disable-pip-version-check pyTelegramBotAPI
+
+          # IMPORTANT: keep the bot alive in the same long-running workflow step.
+          # Starting it in a short step can cause the Actions runner to clean it up
+          # when that step finishes.
+          $log = Join-Path $env:TEMP "telegram_receiver.log"
+          $err = Join-Path $env:TEMP "telegram_receiver_error.log"
+          $proc = Start-Process -FilePath "python" `
+            -ArgumentList @("telegram_receiver.py") `
+            -WorkingDirectory $env:GITHUB_WORKSPACE `
+            -WindowStyle Hidden `
+            -RedirectStandardOutput $log `
+            -RedirectStandardError $err `
+            -PassThru
+
+          Start-Sleep -Seconds 5
+          if ($proc.HasExited) {
+            Write-Host "Telegram receiver stopped unexpectedly."
+            if (Test-Path $log) { Get-Content $log -Tail 80 }
+            if (Test-Path $err) { Get-Content $err -Tail 80 }
+            throw "Telegram file receiver failed to start."
+          }
+
+          Write-Host "Telegram receiver is running (PID $($proc.Id))."
+
+          Write-Host "RDP is active. Telegram receiver is active. Keep the workflow running."
+          for (;;) {
+            if ($proc.HasExited) {
+              Write-Host "Telegram receiver exited. Last logs:"
+              if (Test-Path $log) { Get-Content $log -Tail 80 }
+              if (Test-Path $err) { Get-Content $err -Tail 80 }
+              throw "Telegram receiver stopped."
+            }
+            Write-Host ("[{0}] RDP + Telegram are still running..." -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"))
+            Start-Sleep -Seconds 60
+          }
+
